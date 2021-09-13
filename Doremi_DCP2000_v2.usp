@@ -1,0 +1,663 @@
+/*******************************************************************************************
+  SIMPL+ Module Information
+*******************************************************************************************/
+/*
+Dealer Name:
+System Name:
+System Number:
+Programmer: Marinus Aleksander Beck
+Comments: 
+*/
+
+/*******************************************************************************************
+  Compiler Directives
+*******************************************************************************************/
+// #ENABLE_DYNAMIC
+// #SYMBOL_NAME ""
+// #HINT ""
+#DEFINE_CONSTANT MAXLIST 			50 //VTPRO ListMax
+#DEFINE_CONSTANT BUFFERSIZE 		8000
+#DEFINE_CONSTANT CONNECTIONTIMEOUT  300 //connection timeout
+#DEFINE_CONSTANT GATHERTIMEOUT 		300 //data timeout
+#DEFINE_CONSTANT HEADER 			"\x06\x0E\x2B\x34\x02\x05\x01\x0A\x0E\x10\x01\x01\x01" //Key
+#DEFINE_CONSTANT REQUESTID			"\x00\x00\x00\x01" //random id
+// #CATEGORY "" 
+// #PRINT_TO_TRACE
+// #DIGITAL_EXPAND 
+// #ANALOG_SERIAL_EXPAND
+// #OUTPUT_SHIFT 
+// #HELP_PDF_FILE ""
+#DEFAULT_VOLATILE
+#ENABLE_STACK_CHECKING
+#ENABLE_TRACE
+// #ENCODING_ASCII
+// #ENCODING_UTF16
+// #ENCODING_INHERIT_FROM_PARENT
+// #ENCODING_INHERIT_FROM_PROGRAM
+/*
+#HELP_BEGIN
+#HELP_END
+*/
+
+/*******************************************************************************************
+  DIGITAL, ANALOG and SERIAL INPUTS and OUTPUTS
+*******************************************************************************************/
+
+DIGITAL_INPUT _SKIP_;
+DIGITAL_INPUT _SKIP_;
+DIGITAL_INPUT _SKIP_;
+DIGITAL_INPUT _SKIP_;
+DIGITAL_INPUT _SKIP_;
+DIGITAL_INPUT _SKIP_;
+DIGITAL_INPUT GetSPLList;
+DIGITAL_INPUT Load;
+DIGITAL_INPUT Play;
+DIGITAL_INPUT Pause;
+DIGITAL_INPUT Eject;
+DIGITAL_INPUT _SKIP_;
+DIGITAL_INPUT _SKIP_;
+ANALOG_INPUT SelectedListIndex;
+
+DIGITAL_OUTPUT _SKIP_;
+DIGITAL_OUTPUT _SKIP_;
+DIGITAL_OUTPUT _SKIP_;
+DIGITAL_OUTPUT _SKIP_;
+DIGITAL_OUTPUT _SKIP_;
+DIGITAL_OUTPUT _SKIP_;
+DIGITAL_OUTPUT _SKIP_;
+DIGITAL_OUTPUT Load_Fb;
+DIGITAL_OUTPUT Play_Fb;
+DIGITAL_OUTPUT Pause_Fb;
+DIGITAL_OUTPUT Eject_Fb;
+DIGITAL_OUTPUT ConnectionError;
+DIGITAL_OUTPUT _SKIP_;
+ANALOG_OUTPUT NumberOfItems;
+ANALOG_OUTPUT PlayDurationSeconds;
+ANALOG_OUTPUT PlayPositionSeconds;
+ANALOG_OUTPUT PlayPositionBar;
+STRING_OUTPUT _SKIP_;
+STRING_OUTPUT ConnectionErrorMessage;
+STRING_OUTPUT _SKIP_;
+STRING_OUTPUT List[MAXLIST, MAXLIST];
+
+/*******************************************************************************************
+  SOCKETS
+*******************************************************************************************/
+
+TCP_CLIENT client[BUFFERSIZE];
+
+/*******************************************************************************************
+  Parameters
+*******************************************************************************************/
+
+STRING_PARAMETER IPAddress[15];
+INTEGER_PARAMETER Port;
+
+STRING_PARAMETER FontType[20];
+INTEGER_PARAMETER FontSize;
+STRING_PARAMETER FontColor[6];
+
+INTEGER_PARAMETER EnableFormattedText;
+
+/*******************************************************************************************
+  Parameter Properties
+*******************************************************************************************/
+
+#BEGIN_PARAMETER_PROPERTIES IPAddress
+	propValidUnits = unitString;
+	propDefaultUnit = unitString;
+	propDefaultValue = "192.168.1.123";
+#END_PARAMETER_PROPERTIES
+
+#BEGIN_PARAMETER_PROPERTIES Port
+	propValidUnits = unitDecimal;
+	propDefaultUnit = unitDecimal;
+	propDefaultValue = 11730d;
+#END_PARAMETER_PROPERTIES
+
+#BEGIN_PARAMETER_PROPERTIES FontType
+	propValidUnits = unitString;
+	propDefaultUnit = unitString;
+	propDefaultValue = "Crestron Sans Pro Semibold";
+#END_PARAMETER_PROPERTIES
+
+#BEGIN_PARAMETER_PROPERTIES FontSize
+	propValidUnits = unitDecimal;
+	propDefaultUnit = unitDecimal;
+	propBounds = 10d, 48d;
+	propDefaultValue = 16d;
+#END_PARAMETER_PROPERTIES
+
+#BEGIN_PARAMETER_PROPERTIES FontColor
+	propValidUnits = unitString;
+	propDefaultUnit = unitString;
+	propDefaultValue = "000000";
+#END_PARAMETER_PROPERTIES
+
+#BEGIN_PARAMETER_PROPERTIES EnableFormattedText
+	propValidUnits = unitDecimal;
+	propDefaultUnit = unitDecimal;
+    propList = { 1d, "Enable" }, { 0d, "Disable" };
+#END_PARAMETER_PROPERTIES
+
+/*******************************************************************************************
+  Structure Definitions
+*******************************************************************************************/
+
+STRUCTURE SPLListStruct
+{
+	STRING ID[32];
+	STRING Title[128];
+	INTEGER Duration;
+};
+
+SPLListStruct SPLListInfo[MAXLIST];
+
+
+/*******************************************************************************************
+  Global Variables
+*******************************************************************************************/
+INTEGER loaded;
+INTEGER infoRequestCounter;
+INTEGER numberOfIDs;
+INTEGER trashByte;
+INTEGER totalIncommingDataBytes;
+STRING command[64];
+STRING connectionStatus[9][50];
+STRING commandHeader[24];
+STRING tempBuffer[BUFFERSIZE];
+
+/*******************************************************************************************
+  Functions
+*******************************************************************************************/
+
+STRING_FUNCTION searchReplace(STRING data, STRING search, STRING replace)
+{
+	INTEGER pos;
+	pos = find(search, data);
+	while(pos>0)
+	{
+		SETSTRING(replace, pos, data);
+		data = mid(data, 1, pos) + mid(data, pos + 2, len(data));
+		pos = find(search, data);
+	}
+	return(data);
+}
+
+STRING_FUNCTION utf8ToISO8859(STRING data)
+{
+	data = searchReplace(data, "\xC3\xA6","æ");
+	data = searchReplace(data, "\xC3\xB8","ø");
+	data = searchReplace(data, "\xC3\xA5","å");
+	data = searchReplace(data, "\xC3\x86","Æ");
+	data = searchReplace(data, "\xC3\x98","Ø");
+	data = searchReplace(data, "\xC3\x85","Å");
+	data = searchReplace(data, "\xC3\xA9","é");
+	return (data);
+} 
+
+STRING_FUNCTION HTMLColorLable(STRING text)
+{
+	INTEGER marker;
+	STRING returnString[250];
+
+	makestring(returnString, "<P><FONT size=\x22%d\x22 face=\x22%s\x22 color=\x22#%s\x22>%s</FONT></P>", FontSize, FontType, FontColor, text);
+
+	return (returnString);
+}
+
+FUNCTION ParseSPLListIDs(STRING buffer)
+{	
+	INTEGER i;
+	INTEGER IDLength;
+
+	//trash id
+	for(i = 1 to 6) //remove id and some of the batch bytes.
+		trashByte = getc(buffer);
+	
+	numberOfIDs = getc(buffer) << 8 | getc(buffer);
+
+	if(numberOfIDs > MAXLIST)
+		GenerateUserNotice("numberOfIDs(%d) exceeds MAXLIST: %d", numberOfIDs, MAXLIST );	
+
+	//trash next two bytes of item length, we only support 16bit
+	trashByte = getc(buffer);
+	trashByte = getc(buffer);
+    
+	IDLength = getc(buffer) << 8 | getc(buffer);
+
+	if(len(buffer) = (IDLength*numberOfIDs) + 1)
+	{	
+		for(i = 1 to numberOfIDs)
+		{
+			SPLListInfo[i].ID = removeByLength(IDLength, buffer);
+		}
+
+		infoRequestCounter = 1;
+
+		//Get Infor for the first ID
+		if(client.SocketStatus = 2)
+		{
+			MakeString(command, "%s\x03\x03\x00", HEADER);
+			MakeString(command, "%s\x83\x00\x00%s%s%s", command, chr(len(REQUESTID) + len(SPLListInfo[1].ID)), REQUESTID, SPLListInfo[1].ID);
+			SocketSend(client, command);
+		}
+		else
+		{
+			Trace("Connection Failed while trying to request SPLInfor for first ID");
+		}
+	}
+	else
+	{
+		GenerateUserNotice("Doremi data integrity error, buffer size: %d, numberOfIDs: %d", len(buffer), numberOfIDs);
+	}
+}
+
+FUNCTION ParseSPLListInfo(STRING buffer)
+{
+	INTEGER i;
+	INTEGER duration;
+	INTEGER hours;
+	INTEGER minutes;
+	INTEGER seconds;
+	STRING title[128];
+	STRING listText[64];
+
+	//trash id bytes and UUID
+	for(i = 1 to 20)
+		trashByte = getc(buffer);
+
+	if(len(buffer) = 133) // buffer contains expected amount of data
+	{	
+		title = "";
+
+		for(i = 1 to 128)
+		{
+			if(byte(buffer, 1) > 0)
+				title = title + chr(getc(buffer));
+			else
+				trashByte = getc(buffer);
+		}
+
+		if(getc(buffer) > 0 || getc(buffer) > 0)
+			GenerateUserNotice("Duration too big for item: %d", infoRequestCounter);
+
+		duration = getc(buffer) << 8 | getc(buffer);
+
+		SPLListInfo[infoRequestCounter].Title = title;
+		SPLListInfo[infoRequestCounter].Duration = duration;
+
+		if(infoRequestCounter < numberOfIDs)
+		{
+			infoRequestCounter = infoRequestCounter + 1;
+	
+			//Get Infor for the next ID
+			if(client.SocketStatus = 2)
+			{
+				MakeString(command, "%s\x03\x03\x00", HEADER);
+				MakeString(command, "%s\x83\x00\x00%s%s%s", command, chr(len(REQUESTID) + len(SPLListInfo[infoRequestCounter].ID)), REQUESTID, SPLListInfo[infoRequestCounter].ID);
+				SocketSend(client, command);
+			}
+			else
+			{
+				Trace("Connection Failed while trying to request SPLInfor for list item: %d", infoRequestCounter);
+			}
+		}
+		else //output
+		{
+			for(i = 1 to numberOfIDs)
+			{
+				hours = SPLListInfo[i].Duration / 3600;
+				minutes = (SPLListInfo[i].Duration / 60) mod 60;
+				seconds = SPLListInfo[i].Duration mod 60;
+				makeString(listText,"%s - %d:%d:%d", SPLListInfo[i].Title, hours, minutes, seconds);
+				listText = utf8ToISO8859(listText);
+
+				if(EnableFormattedText)
+					List[i] = HTMLColorLable(listText);
+				else
+					List[i] = listText;
+			}
+
+			NumberOfItems = numberOfIDs;
+		}
+	}
+	else
+	{
+		GenerateUserNotice("Doremi data integrity error, buffer size: %d, expected: 133", len(buffer));
+	}
+	
+}
+
+FUNCTION ParseSPLStatus(STRING buffer)
+{
+	INTEGER i;
+	INTEGER playBackState;
+
+	//trash id
+	for(i = 1 to 4) //remove id and some of the batch bytes.
+		trashByte = getc(buffer);
+	
+	playBackState = getc(buffer);
+
+	Switch(playBackState)
+	{
+		case(0x02): //Play
+		{
+			Play_Fb = ON;
+			Pause_Fb = OFF;
+			Eject_Fb = OFF;
+		}
+		case(0x03): //Pause
+		{
+			Play_Fb = OFF;
+			Pause_Fb = ON;
+			Eject_Fb = OFF;
+		}
+		default:
+		{
+			Play_Fb = OFF;
+			Pause_Fb = OFF;
+			Eject_Fb = OFF;
+		}
+	}
+
+	//trash uuid 16 bytes + 2 of the playlist position, we only support 16 bit
+	for(i = 1 to 18)
+		trashByte = getc(buffer);
+                             
+	PlayPositionSeconds = getc(buffer) << 8 | getc(buffer);
+
+	//trash two first bites of duration, due to 16 bit limitation
+	trashByte = getc(buffer);
+	trashByte = getc(buffer);
+	PlayDurationSeconds = getc(buffer) << 8 | getc(buffer);
+
+	PlayPositionBar = (65535 / PlayDurationSeconds) * PlayPositionSeconds;
+}
+
+FUNCTION ParseSPLLoadProgress(STRING buffer)
+{
+	INTEGER i;
+	INTEGER errorCode;
+	INTEGER progressNum;
+	INTEGER progressDen;
+	STRING description[128];
+
+	//trash id
+	for(i = 1 to 6) //remove id and some of the batch bytes.
+		trashByte = getc(buffer);
+	
+	errorCode = getc(buffer) << 8 | getc(buffer);
+
+	trashByte = getc(buffer);
+	trashByte = getc(buffer);
+
+	progressNum = getc(buffer) << 8 | getc(buffer);
+
+	trashByte = getc(buffer);
+	trashByte = getc(buffer);
+
+	progressDen = getc(buffer) << 8 | getc(buffer);
+
+	//trash uuid 16 bytes + 2 of the playlist position, we only support 16 bit
+	if(len(buffer) > 4)
+	{
+		for(i = 1 to len(buffer) -1)
+		{
+			if(byte(buffer, 1) > 0)
+				description = description + chr(getc(buffer));
+			else
+				trashByte = getc(buffer);
+		}
+	}
+
+	if(description = "Cue Show" ||
+	   description = "Query remote SPB" || 
+	   left(description, 8) = "Validate")
+	{
+		Load_Fb = ON;
+
+		delay(20);
+
+		if(client.SocketStatus = 2)
+		{
+			MakeString(command, "%s\x03\x31\x00", HEADER);
+			MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+			SocketSend(client, command);
+		}
+	}
+	else if(left(description, 7) = "Cue CPL" && progressNum != progressDen)
+	{
+		Load_Fb = ON;
+
+		delay(20);
+
+		if(client.SocketStatus = 2)
+		{
+			MakeString(command, "%s\x03\x31\x00", HEADER);
+			MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+			SocketSend(client, command);
+		}
+	}
+    else
+	{
+		Load_Fb = OFF;
+	}
+}
+
+/*******************************************************************************************
+  SIMPL Events
+*******************************************************************************************/
+
+PUSH GetSPLList
+{
+	if(Load_Fb = OFF && client.SocketStatus = 2)
+	{
+		MakeString(command, "%s\x03\x01\x00", HEADER);
+		MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+		SocketSend(client, command);
+	}
+}
+
+PUSH Load
+{
+	if(Load_Fb = OFF && client.SocketStatus = 2 && SelectedListIndex > 0 && SelectedListIndex <= numberOfIDs)
+	{
+		Load_Fb = ON;
+
+		MakeString(command, "%s\x03\x09\x00", HEADER);
+		MakeString(command, "%s\x83\x00\x00%s%s%s", command, chr(len(REQUESTID) + len(SPLListInfo[SelectedListIndex].ID)), REQUESTID, SPLListInfo[SelectedListIndex].ID);
+		SocketSend(client, command);
+	}
+}
+
+PUSH Play
+{
+	if(Load_Fb = OFF && client.SocketStatus = 2)
+	{
+		MakeString(command, "%s\x03\x0B\x00", HEADER);
+		MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+		SocketSend(client, command);
+	}	
+}
+
+PUSH Pause
+{
+	if(Load_Fb = OFF && client.SocketStatus = 2)
+	{
+		MakeString(command, "%s\x03\x0D\x00", HEADER);
+		MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+		SocketSend(client, command);
+	}		
+}
+
+PUSH Eject
+{
+	if(Load_Fb = OFF && client.SocketStatus = 2)
+	{
+		MakeString(command, "%s\x03\x0F\x00", HEADER);
+		MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+		SocketSend(client, command);
+	}	
+}
+
+/*******************************************************************************************
+  TCP Events
+*******************************************************************************************/
+
+SOCKETSTATUS client
+{
+	SIGNED_INTEGER status;
+
+	Delay(100);
+	status = SocketGetStatus();
+
+	if(status = 2)
+	{
+		trace("Doremi Connected!");
+		GenerateUserNotice("Doremi Connected!");
+		ConnectionError = 0;
+		ConnectionErrorMessage = "";
+
+		MakeString(command, "%s\x03\x01\x00", HEADER);
+		MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+		SocketSend(client, command);
+	}
+	else
+	{
+		trace("Doremi Connection Status: %s", connectionStatus[status]);
+		GenerateUserNotice("Doremi Connection Status: %s", connectionStatus[status]);
+		ConnectionError = 1;
+		ConnectionErrorMessage = connectionStatus[status];
+	}
+}
+
+SOCKETRECEIVE client
+{
+	while(find("\x06\x0E\x2B", client.SocketRxBuf))
+	{
+		commandHeader = GatherByLength(20, client.SocketRxBuf, GATHERTIMEOUT);
+
+		if(len(commandHeader) > 0)
+		{
+			totalIncommingDataBytes = Byte(commandHeader, len(commandHeader) - 1 ) << 8 | Byte(commandHeader, len(commandHeader));
+
+			if(totalIncommingDataBytes > 4) // more than just ID
+			{
+		        tempBuffer = GatherByLength(totalIncommingDataBytes, client.SocketRxBuf, GATHERTIMEOUT);
+
+				if(len(tempBuffer) = 0)
+				{
+					GenerateUserNotice("Doremi gather timeout #2 - totalIncommingDataBytes: %d", totalIncommingDataBytes);
+					clearBuffer(client.SocketRxBuf);
+				}
+                else if(len(tempBuffer) > 4) //successfull gather and a valid amount of data
+				{
+					commandHeader = mid(commandHeader, 14, 3); //get response bytes
+
+					if(commandHeader = "\x03\x02\x00")
+						ParseSPLListIDs(tempBuffer);
+					else if(commandHeader = "\x03\x04\x00")
+						ParseSPLListInfo(tempBuffer);
+					else if(commandHeader = "\x03\x1C\x00")
+						ParseSPLStatus(tempBuffer);
+					else if(commandHeader = "\x03\x32\x00")
+						ParseSPLLoadProgress(tempBuffer);
+					else if(commandHeader = "\x03\x0A\x00")
+					{
+						Load_Fb = ON;
+
+						Pause_Fb = OFF;
+						Play_Fb = OFF;
+						Eject_Fb = OFF;
+
+						PlayPositionBar = 0;
+						PlayPositionSeconds = 0;
+						PlayDurationSeconds = 0;
+
+						//request load progress
+						MakeString(command, "%s\x03\x31\x00", HEADER);
+						MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+						SocketSend(client, command);
+					}
+					else if(commandHeader = "\x03\x0C\x00")
+					{
+						Pause_Fb = OFF;
+						Play_Fb = ON;
+						Eject_Fb = OFF;
+					}
+					else if(commandHeader = "\x03\x0E\x00")
+					{
+						Pause_Fb = ON;
+						Play_Fb = OFF;
+						Eject_Fb = OFF;
+					}
+					else if(commandHeader = "\x03\x10\x00")
+					{
+						Pause_Fb = OFF;
+						Play_Fb = OFF;
+						Eject_Fb = ON;
+
+						PlayPositionBar = 0;
+						PlayPositionSeconds = 0;
+						PlayDurationSeconds = 0;
+					}
+				}
+
+				clearbuffer(tempBuffer);
+			}
+			else //parsing not needed.
+			{
+				//GenerateUserNotice("Doremi error - totalIncommingDataBytes: %d", totalIncommingDataBytes);
+				clearBuffer(client.SocketRxBuf);
+			}
+
+			clearBuffer(commandHeader);
+		}
+		else //not enough data to parse.
+		{
+			GenerateUserNotice("Doremi gather timeout #1 - could not obtain commandHeader");
+			clearBuffer(client.SocketRxBuf);
+		}
+	}
+
+	clearBuffer(client.SocketRxBuf);
+}
+
+/*******************************************************************************************
+  Main()
+*******************************************************************************************/
+
+Function Main()
+{
+	WaitForInitializationComplete();
+
+	connectionStatus[0] = "Not Connected";
+	connectionStatus[1] = "Waiting for Connection";
+	connectionStatus[2] = "Connected";
+	connectionStatus[3] = "Connection Failed";
+	connectionStatus[4] = "Connection Broken Remotely";
+	connectionStatus[5] = "Connection Broken Locally";
+	connectionStatus[6] = "Performing DNS Lookup";
+	connectionStatus[7] = "DNS Lookup Failed";
+	connectionStatus[8] = "DNS Name Resolved";
+
+	SocketConnectClient(client, IPAddress, Port, 1);
+
+	while(1)
+	{
+		delay(100);
+
+		if(Play_Fb)
+		{
+			if(client.SocketStatus = 2)
+			{
+				MakeString(command, "%s\x03\x1B\x00", HEADER);
+				MakeString(command, "%s\x83\x00\x00%s%s", command, chr(len(REQUESTID)), REQUESTID);
+				SocketSend(client, command);
+			}
+			delay(100);
+		}
+	}
+}
